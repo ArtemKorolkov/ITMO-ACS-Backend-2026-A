@@ -1,0 +1,111 @@
+name: Развёртывание приложения
+
+on:
+  push:
+    branches: [lab4]
+    paths:
+      - 'БР1.2/Корольков Артем/labs/lab3/**'
+      - 'БР1.2/Корольков Артем/labs/lab4/**'
+      - 'БР1.2/Корольков Артем/homeworks/hw6/**'
+      - '!**/*.pdf'
+      - '!**/*.docx'
+      - '!**/evidence/**'
+      - '.github/workflows/deploy.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restaurant-lab4-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Проверка конфигурации и сборка образов
+        shell: bash
+        env:
+          APP_ENV_FILE: /dev/null
+          JWT_SECRET: validation-only
+          SERVICE_KEY: validation-only
+          RABBITMQ_PASSWORD: validation-only
+        run: |
+          set -euo pipefail
+          lab3_dir='БР1.2/Корольков Артем/labs/lab3'
+          lab4_dir='БР1.2/Корольков Артем/labs/lab4'
+
+          bash -n "$lab4_dir/compose.sh"
+          bash -n 'БР1.2/Корольков Артем/homeworks/hw6/deploy.sh'
+          bash "$lab4_dir/compose.sh" config --quiet
+
+          for service in auth-service restaurant-service reservation-service api-gateway; do
+            docker build \
+              -f "$lab3_dir/services/$service/Dockerfile" \
+              -t "restaurant-check:$service" \
+              "$lab3_dir"
+          done
+
+  deploy:
+    needs: validate
+    if: github.ref == 'refs/heads/lab4'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Развёртывание и проверка версии
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          for secret_name in DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_KEY DEPLOY_KNOWN_HOSTS; do
+            if [[ -z "${!secret_name}" ]]; then
+              printf 'Secret %s is empty\n' "$secret_name" >&2
+              exit 1
+            fi
+          done
+
+          install -d -m 0700 "$HOME/.ssh"
+          umask 077
+
+          printf '%s\n' "$DEPLOY_KEY" |
+            tr -d '\r' > "$HOME/.ssh/restaurant_lab4_ci"
+
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" |
+            tr -d '\r' > "$HOME/.ssh/known_hosts"
+
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=20 \
+            -i "$HOME/.ssh/restaurant_lab4_ci" \
+            -p "$DEPLOY_PORT" \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "deploy $GITHUB_SHA"
+
+          curl --fail --silent --show-error \
+            --retry 5 --retry-delay 3 --max-time 20 \
+            "http://$DEPLOY_HOST/deployment.json" \
+            -o "$RUNNER_TEMP/deployment.json"
+
+          python3 - "$RUNNER_TEMP/deployment.json" "$GITHUB_SHA" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              deployment = json.load(stream)
+
+          assert deployment["revision"] == sys.argv[2], deployment
+          print("Server runs commit", deployment["revision"])
+          PY
